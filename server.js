@@ -229,8 +229,8 @@ app.post("/generate-gif", upload.single('image'), async (req, res) => {
   }
 });
 
+const PORT = process.env.PORT || 3000;
 
-app.listen(3000, () => {
-  console.log("🚀 AI GIF server running on http://localhost:3000");
-  console.log("📝 Make sure to set STABILITY_API_KEY in .env file");
+app.listen(PORT, () => {
+  console.log(`🚀 AI GIF server running on port ${PORT}`);
 });
