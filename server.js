@@ -205,12 +205,15 @@ app.post("/generate-gif", upload.single('image'), async (req, res) => {
           console.log("🗑️ Frames folder deleted");
         }
 
+        const publicGifUrl = `${req.protocol}://${req.get("host")}/output/${path.basename(outputGif)}`;
+
         res.json({
           success: true,
           message: "Pipeline executed: Image Upload → Video → GIF",
-          gif_path: outputGif,
+          gif_url: publicGifUrl,
           generated_video: videoUrl
         });
+        
       }
     );
 
