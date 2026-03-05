@@ -205,15 +205,24 @@ app.post("/generate-gif", upload.single('image'), async (req, res) => {
           console.log("🗑️ Frames folder deleted");
         }
 
-        const publicGifUrl = `${req.protocol}://${req.get("host")}/output/${path.basename(outputGif)}`;
+        const gifBuffer = fs.readFileSync(outputGif);
+
+        // convert to base64
+        const base64Gif = gifBuffer.toString("base64");
+
+        // optional: add data URI prefix
+        const base64Data = `data:image/gif;base64,${base64Gif}`;
+
+        // delete the gif file after reading
+        fs.unlinkSync(outputGif);
 
         res.json({
           success: true,
           message: "Pipeline executed: Image Upload → Video → GIF",
-          gif_url: publicGifUrl,
+          gif_base64: base64Data,
           generated_video: videoUrl
         });
-        
+
       }
     );
 
