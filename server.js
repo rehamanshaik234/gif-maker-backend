@@ -48,25 +48,26 @@ app.post("/generate-gif", upload.single('image'), async (req, res) => {
       return res.status(400).json({ error: "No image file uploaded" });
     }
 
-    // Build enhanced prompt based on optional parameters
-    let enhancedPrompt = basePrompt;
-    
+    let enhancedPrompt = `${basePrompt}`;
+
     if (action) {
-      enhancedPrompt += `, the subject is ${action}`;
-    }
-    
-    if (style) {
-      enhancedPrompt += `, in ${style} style`;
-    }
-    
-    if (environment) {
-      enhancedPrompt += `, set in a ${environment} environment`;
+      enhancedPrompt += `, the subject is actively ${action} with clear body movement`;
     }
 
-    // Add smooth motion guidance if not already in base prompt
-    if (!enhancedPrompt.toLowerCase().includes("smooth")) {
-      enhancedPrompt += ", with smooth and fluid motion";
+    if (style) {
+      enhancedPrompt += `, rendered in ${style} style`;
     }
+
+    if (environment) {
+      enhancedPrompt += `, the entire scene takes place inside a ${environment}, background fully transformed into a ${environment}`;
+    }
+
+    enhancedPrompt += ", cinematic lighting, smooth motion, detailed environment, dynamic camera movement";
+
+    // Add smooth motion guidance if not already in base prompt
+    // if (!enhancedPrompt.toLowerCase().includes("smooth")) {
+    //   enhancedPrompt += ", with smooth and fluid motion";
+    // }
 
     console.log(`📝 Enhanced prompt: ${enhancedPrompt}`);
     const userPrompt = enhancedPrompt;
