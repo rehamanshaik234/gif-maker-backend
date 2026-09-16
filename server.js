@@ -4,54 +4,86 @@ import path from "path";
 import axios from "axios";
 import { exec } from "child_process";
 import dotenv from "dotenv";
+import multer from "multer";
+import cors from "cors";
+
+import { initDatabase, pool } from "./db.js";
+import authRoutes, { optionalAuth } from "./routes/auth.js";
+import gifRoutes from "./routes/gifs.js";
 
 dotenv.config();
 
 const app = express();
-app.use(express.json());
 
-const BASE_FRAMES_DIR = "./frames";
-const OUTPUT_DIR = "./output";
+const BASE_FRAMES_DIR = path.resolve("./frames");
+const OUTPUT_DIR = path.resolve("./output");
+const UPLOADS_DIR = path.resolve("./uploads");
 
-import multer from "multer";
+if (!fs.existsSync(BASE_FRAMES_DIR)) fs.mkdirSync(BASE_FRAMES_DIR, { recursive: true });
+if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
-if (!fs.existsSync(BASE_FRAMES_DIR)) fs.mkdirSync(BASE_FRAMES_DIR);
-if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR);
+const upload = multer({ dest: 'uploads/', limits: { fileSize: 200 * 1024 * 1024 } });
 
-/**
- * Solution: Use Stability AI's image-to-image for consistent frames
- */
-// RECOMMENDED: Use Replicate API with Stable Diffusion img2img
-// Install: npm install replicate
-import Replicate from "replicate";
-const upload = multer({ dest: 'uploads/' });
+app.use(cors());
+app.use(express.json({ limit: "200mb" }));
+app.use(express.urlencoded({ limit: "200mb", extended: true }));
 
-app.post("/generate-gif", upload.single('image'), async (req, res) => {
+// Serve output files publicly
+app.use("/output", express.static(OUTPUT_DIR));
+app.use("/uploads", express.static(UPLOADS_DIR));
+
+// Initialize MySQL Database
+initDatabase().catch(err => console.error("Database initialization warning:", err.message));
+
+// Mount Routes
+app.use("/api/auth", authRoutes);
+app.use("/api/gifs", gifRoutes);
+
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+// Helper function to execute shell commands
+function runFfmpeg(command) {
+  return new Promise((resolve, reject) => {
+    exec(command, (error, stdout, stderr) => {
+      if (error) {
+        console.error("FFmpeg error:", stderr || error.message);
+        return reject(error);
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+// Generate GIF Endpoint
+app.post("/generate-gif", upload.single("image"), optionalAuth, async (req, res) => {
+  const startTime = Date.now();
+  console.log("🚀 /generate-gif called");
+
+  let uploadedImagePath = null;
+
   try {
-    // Generate timestamp-based frames directory
-    const dateTime = new Date().toISOString().replace(/[:.]/g, '-').split('T')[0] + '_' + new Date().toTimeString().split(' ')[0].replace(/:/g, '-');
-    const FRAMES_DIR = path.join(BASE_FRAMES_DIR, dateTime);
-
-    // Extract required and optional parameters
-    const basePrompt = req.body.prompt;
-    const environment = req.body.environment; // optional: Gym, Fire, City, Space, etc.
-    const style = req.body.style; // optional: cartoon, anime, realistic, etc.
-    const action = req.body.action; // optional: running, kicking, flying, etc.
+    const { prompt, style, environment, action } = req.body;
     const uploadedImage = req.file;
 
-    // Validate mandatory parameters
-    if (!basePrompt) {
-      return res.status(400).json({ error: "Prompt is required" });
+    if (!prompt) {
+      return res.status(400).json({ error: "Prompt required" });
     }
 
     if (!uploadedImage) {
-      return res.status(400).json({ error: "No image file uploaded" });
+      return res.status(400).json({ error: "Image required" });
     }
 
-    let enhancedPrompt = `${basePrompt}`;
+    uploadedImagePath = uploadedImage.path;
+
+    /* ------------------ PROMPT ENHANCEMENT ------------------ */
+    let enhancedPrompt = prompt;
 
     if (action) {
-      enhancedPrompt += `, the subject is actively ${action} with clear body movement`;
+      enhancedPrompt += `, the subject is actively ${action} with dynamic body movement`;
     }
 
     if (style) {
@@ -59,185 +91,233 @@ app.post("/generate-gif", upload.single('image'), async (req, res) => {
     }
 
     if (environment) {
-      enhancedPrompt += `, the entire scene takes place inside a ${environment}, background fully transformed into a ${environment}`;
+      enhancedPrompt += `, scene takes place inside a ${environment}, background fully transformed into ${environment}`;
     }
 
-    enhancedPrompt += ", cinematic lighting, smooth motion, detailed environment, dynamic camera movement";
+    enhancedPrompt += ", cinematic lighting, smooth motion, dynamic camera movement, high detail";
 
-    // Add smooth motion guidance if not already in base prompt
-    // if (!enhancedPrompt.toLowerCase().includes("smooth")) {
-    //   enhancedPrompt += ", with smooth and fluid motion";
-    // }
+    console.log("📝 Enhanced Prompt:", enhancedPrompt);
 
-    console.log(`📝 Enhanced prompt: ${enhancedPrompt}`);
-    const userPrompt = enhancedPrompt;
-
-    // Clean old frames
-    if (fs.existsSync(FRAMES_DIR)) {
-      fs.rmSync(FRAMES_DIR, { recursive: true, force: true });
-    }
-    fs.mkdirSync(FRAMES_DIR, { recursive: true });
-
-    console.log("📤 Converting uploaded image to base64...");
-
-    // Read uploaded image and convert to data URI
+    /* ------------------ IMAGE → BASE64 ------------------ */
     const imageBuffer = fs.readFileSync(uploadedImage.path);
-    const imageBase64 = imageBuffer.toString('base64');
-    const mimeType = uploadedImage.mimetype || 'image/jpeg';
-    const dataUri = `data:${mimeType};base64,${imageBase64}`;
+    const base64 = imageBuffer.toString("base64");
+    const mime = uploadedImage.mimetype || "image/jpeg";
+    const dataUri = `data:${mime};base64,${base64}`;
 
-    console.log("🎬 Generating video from image...");
+    console.log("🎬 Sending request to Runway");
 
-    // Generate video from image using RunwayML
-    const videoGenResponse = await axios.post(
+    /* ------------------ RUNWAY VIDEO GENERATION ------------------ */
+    const runwayResponse = await axios.post(
       "https://api.dev.runwayml.com/v1/image_to_video",
       {
-        model: "gen4_turbo", // Options: gen4_turbo, veo3.1, gen3a_turbo, veo3.1_fast, veo3
-        promptImage: dataUri, // Data URI of uploaded image
-        promptText: userPrompt, // Optional: guide the motion
-        ratio: "1280:720", // Options: 1280:720, 720:1280, 1104:832, 832:1104, 960:960, 1584:672
-        duration: 5, // 2-10 seconds
-        seed: Math.floor(Math.random() * 4294967295)
+        model: "gen4_turbo",
+        promptImage: dataUri,
+        promptText: enhancedPrompt.slice(0, 512),
+        ratio: "1280:720",
+        duration: 5
       },
       {
         headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${process.env.RUNWAY_API_KEY}`,
-          "X-Runway-Version": "2024-11-06"
+          Authorization: `Bearer ${process.env.RUNWAY_API_KEY}`,
+          "X-Runway-Version": "2024-11-06",
+          "Content-Type": "application/json"
         }
       }
     );
 
-    const videoTaskId = videoGenResponse.data.id;
-    console.log(`📹 Video generation task: ${videoTaskId}`);
+    const taskId = runwayResponse.data.id;
+    console.log("📌 Runway task:", taskId);
 
-    // Clean up uploaded file
-    fs.unlinkSync(uploadedImage.path);
-
-    // Poll for video completion
+    /* ------------------ POLLING ------------------ */
     let videoUrl = null;
-    let attempts = 0;
-    const maxVideoAttempts = 60;
 
-    while (!videoUrl && attempts < maxVideoAttempts) {
-      await new Promise(resolve => setTimeout(resolve, 5000));
+    while (!videoUrl) {
+      await new Promise((r) => setTimeout(r, 5000));
 
-      const videoStatusResponse = await axios.get(
-        `https://api.dev.runwayml.com/v1/tasks/${videoTaskId}`,
+      const status = await axios.get(
+        `https://api.dev.runwayml.com/v1/tasks/${taskId}`,
         {
           headers: {
-            "Authorization": `Bearer ${process.env.RUNWAY_API_KEY}`,
+            Authorization: `Bearer ${process.env.RUNWAY_API_KEY}`,
             "X-Runway-Version": "2024-11-06"
           }
         }
       );
 
-      const status = videoStatusResponse.data.status;
-      console.log(`⏳ Video status: ${status}`);
+      console.log("📊 Status:", status.data.status);
 
-      if (status === "SUCCEEDED") {
-        const output = videoStatusResponse.data.output;
-        videoUrl = output[0]?.url || output[0];
-        console.log(`🎥 Video URL: ${videoUrl}`);
-        break;
-      } else if (status === "FAILED") {
-        const failureReason = videoStatusResponse.data.failure || "Unknown reason";
-        throw new Error(`Video generation failed: ${failureReason}`);
+      if (status.data.status === "SUCCEEDED") {
+        const output = status.data.output;
+        if (typeof output[0] === "string") {
+          videoUrl = output[0];
+        } else if (output[0]?.url) {
+          videoUrl = output[0].url;
+        }
       }
 
-      attempts++;
+      if (status.data.status === "FAILED") {
+        throw new Error("Runway video generation failed");
+      }
     }
 
-    if (!videoUrl) {
-      throw new Error("Video generation timed out");
-    }
+    console.log("🎥 Video URL:", videoUrl);
 
-    console.log("✅ Video generated successfully!");
-    console.log("📥 Downloading video...");
-
-    // Download the video
+    /* ------------------ DOWNLOAD RAW VIDEO ------------------ */
     const videoResponse = await axios.get(videoUrl, {
-      responseType: 'arraybuffer'
+      responseType: "arraybuffer"
     });
+
+    const videoBuffer = Buffer.from(videoResponse.data);
+
+    const uniqueId = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     
-    const videoPath = path.join(OUTPUT_DIR, 'temp_video.mp4');
-    fs.writeFileSync(videoPath, Buffer.from(videoResponse.data));
+    // File names for both Clean and Watermarked versions
+    const cleanVideoName = `video_${uniqueId}.mp4`;
+    const watermarkedVideoName = `video_wm_${uniqueId}.mp4`;
 
-    console.log("📸 Extracting frames...");
+    const cleanGifName = `gif_${uniqueId}.gif`;
+    const watermarkedGifName = `gif_wm_${uniqueId}.gif`;
 
-    // Extract frames using ffmpeg
-    await new Promise((resolve, reject) => {
-      exec(
-        `ffmpeg -i ${videoPath} -vf fps=10 ${FRAMES_DIR}/frame_%03d.png`,
-        (error, stdout, stderr) => {
-          if (error) {
-            console.error("FFmpeg extraction error:", stderr);
-            reject(error);
-          } else {
-            console.log("✅ Frames extracted");
-            resolve();
-          }
-        }
-      );
-    });
+    const cleanWebpName = `sticker_${uniqueId}.webp`;
+    const watermarkedWebpName = `sticker_wm_${uniqueId}.webp`;
 
-    // Clean up temp video
-    fs.unlinkSync(videoPath);
+    const cleanVideoPath = path.join(OUTPUT_DIR, cleanVideoName);
+    const watermarkedVideoPath = path.join(OUTPUT_DIR, watermarkedVideoName);
 
-    console.log("🎬 Creating GIF...");
+    const cleanGifPath = path.join(OUTPUT_DIR, cleanGifName);
+    const watermarkedGifPath = path.join(OUTPUT_DIR, watermarkedGifName);
 
-    const outputGif = path.join(OUTPUT_DIR, `animation_${Date.now()}.gif`);
+    const cleanWebpPath = path.join(OUTPUT_DIR, cleanWebpName);
+    const watermarkedWebpPath = path.join(OUTPUT_DIR, watermarkedWebpName);
 
-    exec(
-      `ffmpeg -y -framerate 10 -pattern_type glob -i '${FRAMES_DIR}/frame_*.png' \
-      -vf "split[s0][s1];[s0]palettegen=max_colors=256[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5" \
-      -loop 0 ${outputGif}`,
-      (error, stdout, stderr) => {
-        if (error) {
-          console.error("FFmpeg error:", stderr);
-          return res.status(500).json({ error: "GIF generation failed" });
-        }
+    // Save initial clean raw video
+    fs.writeFileSync(cleanVideoPath, videoBuffer);
 
-        console.log("✨ GIF created successfully!");
+    /* ------------------ FFMPEG: GENERATE WATERMARKED VIDEO ------------------ */
+    // Watermark text: "GifMaker AI"
+    const wmDrawtextVideo = "drawtext=text='GifMaker AI':fontsize=18:fontcolor=white@0.9:box=1:boxcolor=black@0.4:boxborderw=6:x=w-tw-15:y=h-th-15";
+    const wmDrawtextGif = "drawtext=text='GifMaker AI':fontsize=16:fontcolor=white@0.9:box=1:boxcolor=black@0.4:boxborderw=6:x=w-tw-12:y=h-th-12";
 
-        // Delete frames folder after successful GIF generation
-        if (fs.existsSync(FRAMES_DIR)) {
-          fs.rmSync(FRAMES_DIR, { recursive: true, force: true });
-          console.log("🗑️ Frames folder deleted");
-        }
+    await runFfmpeg(`ffmpeg -y -i "${cleanVideoPath}" -vf "${wmDrawtextVideo}" -c:a copy "${watermarkedVideoPath}"`);
 
-        const gifBuffer = fs.readFileSync(outputGif);
-
-        // convert to base64
-        const base64Gif = gifBuffer.toString("base64");
-
-        // optional: add data URI prefix
-        const base64Data = `data:image/gif;base64,${base64Gif}`;
-
-        // delete the gif file after reading
-        fs.unlinkSync(outputGif);
-
-        res.json({
-          success: true,
-          message: "Pipeline executed: Image Upload → Video → GIF",
-          gif_base64: base64Data,
-          generated_video: videoUrl
-        });
-
-      }
+    /* ------------------ FFMPEG: GENERATE GIFS (CLEAN & WATERMARKED) ------------------ */
+    // 1. Clean GIF
+    await runFfmpeg(
+      `ffmpeg -y -i "${cleanVideoPath}" -vf "fps=10,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" "${cleanGifPath}"`
     );
 
-  } catch (err) {
-    console.error("Server error:", err);
-    
-    // Clean up uploaded file if it exists
-    if (req.file && fs.existsSync(req.file.path)) {
-      fs.unlinkSync(req.file.path);
+    // 2. Watermarked GIF
+    await runFfmpeg(
+      `ffmpeg -y -i "${cleanVideoPath}" -vf "${wmDrawtextGif},fps=10,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" "${watermarkedGifPath}"`
+    );
+
+    /* ------------------ FFMPEG: GENERATE WEBP STICKERS (CLEAN & WATERMARKED) ------------------ */
+    // 1. Clean WebP
+    await runFfmpeg(
+      `ffmpeg -y -i "${cleanVideoPath}" -vf "fps=12,scale=512:512:flags=lanczos" -c:v libwebp -loop 0 "${cleanWebpPath}"`
+    );
+
+    // 2. Watermarked WebP
+    await runFfmpeg(
+      `ffmpeg -y -i "${cleanVideoPath}" -vf "${wmDrawtextGif},fps=12,scale=512:512:flags=lanczos" -c:v libwebp -loop 0 "${watermarkedWebpPath}"`
+    );
+
+    /* ------------------ READ BASE64 & BUILD URLS ------------------ */
+    const cleanVideoBase64 = fs.readFileSync(cleanVideoPath).toString("base64");
+    const wmVideoBase64 = fs.readFileSync(watermarkedVideoPath).toString("base64");
+
+    const cleanGifBase64 = fs.readFileSync(cleanGifPath).toString("base64");
+    const wmGifBase64 = fs.readFileSync(watermarkedGifPath).toString("base64");
+
+    const cleanWebpBase64 = fs.readFileSync(cleanWebpPath).toString("base64");
+    const wmWebpBase64 = fs.readFileSync(watermarkedWebpPath).toString("base64");
+
+    const host = req.get("host") || `localhost:${PORT}`;
+    const protocol = req.protocol === "https" || req.headers["x-forwarded-proto"] === "https" ? "https" : "http";
+    const serverBaseUrl = `${protocol}://${host}`;
+
+    const publicWatermarkedGifUrl = `${serverBaseUrl}/output/${watermarkedGifName}`;
+    const publicCleanGifUrl = `${serverBaseUrl}/output/${cleanGifName}`;
+
+    const publicWatermarkedVideoUrl = `${serverBaseUrl}/output/${watermarkedVideoName}`;
+    const publicCleanVideoUrl = `${serverBaseUrl}/output/${cleanVideoName}`;
+
+    const publicWatermarkedWebpUrl = `${serverBaseUrl}/output/${watermarkedWebpName}`;
+    const publicCleanWebpUrl = `${serverBaseUrl}/output/${cleanWebpName}`;
+
+    // Clean up uploaded image
+    if (uploadedImagePath && fs.existsSync(uploadedImagePath)) {
+      try { fs.unlinkSync(uploadedImagePath); } catch (e) {}
     }
-    
-    res.status(500).json({ 
-      error: "Server error", 
-      details: err.response?.data || err.message 
+
+    const userId = req.user?.id || req.body.user_id || null;
+
+    // If user is authenticated / specified, save record into database
+    if (userId) {
+      try {
+        await pool.query(
+          `INSERT INTO generated_gifs 
+            (user_id, prompt, style, environment, action, gif_url, gif_no_watermark_url, video_url, video_no_watermark_url, sticker_url, sticker_no_watermark_url) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            userId,
+            prompt,
+            style || null,
+            environment || null,
+            action || null,
+            publicWatermarkedGifUrl,
+            publicCleanGifUrl,
+            publicWatermarkedVideoUrl,
+            publicCleanVideoUrl,
+            publicWatermarkedWebpUrl,
+            publicCleanWebpUrl
+          ]
+        );
+        console.log(`💾 Saved GIF record to database for user ${userId}`);
+      } catch (dbErr) {
+        console.error("Database save record warning:", dbErr.message);
+      }
+    }
+
+    const totalTime = ((Date.now() - startTime) / 1000).toFixed(2);
+    console.log(`🏁 Completed in ${totalTime}s. Watermarked: ${publicWatermarkedGifUrl}, Clean: ${publicCleanGifUrl}`);
+
+    /* ------------------ RESPONSE (DEFAULT WATERMARKED + CLEAN) ------------------ */
+    res.json({
+      success: true,
+      generation_time_seconds: totalTime,
+      // Default URLs
+      gif_url: publicWatermarkedGifUrl,
+      video_url: publicWatermarkedVideoUrl,
+      sticker_url: publicWatermarkedWebpUrl,
+      // Explicit Watermarked URLs
+      gif_watermarked_url: publicWatermarkedGifUrl,
+      video_watermarked_url: publicWatermarkedVideoUrl,
+      sticker_watermarked_url: publicWatermarkedWebpUrl,
+      // Clean / No-Watermark URLs
+      gif_no_watermark_url: publicCleanGifUrl,
+      video_no_watermark_url: publicCleanVideoUrl,
+      sticker_no_watermark_url: publicCleanWebpUrl,
+      // Base64 Outputs
+      gif_base64: `data:image/gif;base64,${wmGifBase64}`, // default watermarked
+      gif_watermarked_base64: `data:image/gif;base64,${wmGifBase64}`,
+      gif_no_watermark_base64: `data:image/gif;base64,${cleanGifBase64}`,
+      video_mp4_base64: `data:video/mp4;base64,${wmVideoBase64}`,
+      video_no_watermark_base64: `data:video/mp4;base64,${cleanVideoBase64}`,
+      sticker_webp_base64: `data:image/webp;base64,${wmWebpBase64}`,
+      sticker_no_watermark_base64: `data:image/webp;base64,${cleanWebpBase64}`
+    });
+
+  } catch (err) {
+    console.error("🔥 Error:", err.response?.data || err.message);
+
+    if (uploadedImagePath && fs.existsSync(uploadedImagePath)) {
+      try { fs.unlinkSync(uploadedImagePath); } catch (e) {}
+    }
+
+    res.status(500).json({
+      error: "Generation failed",
+      details: err.response?.data || err.message
     });
   }
 });
